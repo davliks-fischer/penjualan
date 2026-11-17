@@ -1,0 +1,191 @@
+// ================================================================
+//  firestore.rules  —  SnackZone Security Rules Final v3
+//  Project: penjualan-e6360  |  Region: asia-southeast2
+//  Last updated: 2026-11-14
+// ================================================================
+//
+//  RINGKASAN ATURAN:
+//
+//  /transactions/{orderId}
+//    - Customer (siapa saja, tanpa login): boleh CREATE dengan
+//      validasi ketat pada struktur, tipe, dan nilai awal.
+//    - Customer: TIDAK boleh read, update, atau delete.
+//    - Admin (UID = C1c11Xk6d6WoZySldZ1N4yqDTTy1): boleh
+//      read (get + list) dan update field yang diizinkan.
+//    - Tidak ada yang boleh delete transaksi.
+//
+//  /products/{productId}
+//    - Semua orang: boleh read (untuk katalog publik).
+//    - Hanya admin: boleh create, update, delete.
+//
+//  Semua koleksi lain: deny-all.
+//
+//  CATATAN KEAMANAN (penting):
+//  - Harga dan total dikirim dari browser (client-side).
+//    Rules TIDAK memvalidasi kesesuaian harga dengan katalog.
+//    Admin WAJIB memeriksa detail item sebelum konfirmasi.
+//  - Rules ini memvalidasi struktur dan tipe data, bukan
+//    kebenaran nilai numerik (harga/total).
+//
+// ================================================================
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ──────────────────────────────────────────────────────────
+    //  HELPER: cek apakah request datang dari admin yang sah
+    // ──────────────────────────────────────────────────────────
+    function isAdmin() {
+      return request.auth != null
+          && request.auth.uid == 'C1c11Xk6d6WoZySldZ1N4yqDTTy1';
+    }
+
+    // ──────────────────────────────────────────────────────────
+    //  HELPER: validasi dokumen transaksi baru dari customer
+    //
+    //  Field yang WAJIB ada di payload (dari app.js):
+    //    customerName, customerAddress, customerPhone,
+    //    items, totalItems, totalAmount,
+    //    status, paymentStatus, createdAt
+    //
+    //  Field opsional yang boleh ikut:
+    //    (tidak ada — gunakan hasOnly untuk menutup pintu)
+    // ──────────────────────────────────────────────────────────
+    function isValidNewOrder(data) {
+      let requiredKeys = [
+        'customerName', 'customerAddress', 'customerPhone',
+        'items', 'totalItems', 'totalAmount',
+        'status', 'paymentStatus', 'createdAt'
+      ];
+
+      return
+        // ── 1. Whitelist field: tidak boleh ada field di luar daftar ini ──
+        data.keys().hasOnly(requiredKeys)
+
+        // ── 2. Semua field wajib ada ──
+        && data.keys().hasAll(requiredKeys)
+
+        // ── 3. Tipe data ──
+        && data.customerName    is string
+        && data.customerAddress is string
+        && data.customerPhone   is string
+        && data.items           is list
+        && data.totalItems      is int
+        && data.totalAmount     is int
+        // createdAt harus berupa server timestamp — bukan nilai klien
+        && data.createdAt       == request.time
+
+        // ── 4. Nilai awal yang boleh di-set oleh customer ──
+        && data.status        == 'pending'
+        && data.paymentStatus == 'unpaid'
+
+        // ── 5. Panjang & format string ──
+        && data.customerName.size()    > 0
+        && data.customerName.size()    <= 100
+        && data.customerAddress.size() > 0
+        && data.customerAddress.size() <= 300
+        // nomor WA: hanya digit, sudah dalam format internasional (628xxx)
+        // minimal 10 digit (628 + 7 digit terpendek), maks 15
+        && data.customerPhone.size()   >= 10
+        && data.customerPhone.size()   <= 15
+        // Format: hanya angka 0-9, harus diawali 62 (format internasional Indonesia)
+        && data.customerPhone.matches('^62[0-9]+$')
+
+        // ── 6. Jumlah item ──
+        && data.items.size() >= 1
+        && data.items.size() <= 50
+
+        // ── 7. Angka positif ──
+        && data.totalItems  > 0
+        && data.totalAmount > 0;
+    }
+
+    // ──────────────────────────────────────────────────────────
+    //  HELPER: validasi field yang boleh diubah oleh admin
+    //
+    //  Parameter `diff` adalah MapDiff dari:
+    //    request.resource.data.diff(resource.data)
+    //
+    //  MapDiff memiliki method affectedKeys(), bukan keys().
+    //  affectedKeys() mengembalikan Set berisi field yang
+    //  DITAMBAH, DIUBAH, atau DIHAPUS dalam operasi update.
+    // ──────────────────────────────────────────────────────────
+    function isValidAdminUpdate(diff) {
+      let allowedFields = [
+        'status', 'paymentStatus',
+        'confirmedAt', 'confirmedBy',
+        'updatedAt',   'updatedBy',
+        'completedAt', 'cancelledAt',
+        'adminNote'
+      ];
+
+      // Semua field yang tersentuh harus masuk dalam daftar putih
+      return diff.affectedKeys().hasOnly(allowedFields)
+
+        // Jika status diubah, nilainya harus valid
+        && (
+          !diff.affectedKeys().hasAny(['status'])
+          || request.resource.data.status
+               in ['pending', 'processing', 'completed', 'cancelled']
+        )
+
+        // Jika paymentStatus diubah, nilainya hanya unpaid atau paid
+        && (
+          !diff.affectedKeys().hasAny(['paymentStatus'])
+          || request.resource.data.paymentStatus in ['unpaid', 'paid']
+        )
+
+        // Field inti transaksi TIDAK boleh disentuh, bahkan oleh admin
+        // (customerName, customerAddress, customerPhone, items,
+        //  totalItems, totalAmount, createdAt tidak boleh diubah)
+        && !diff.affectedKeys().hasAny([
+          'customerName', 'customerAddress', 'customerPhone',
+          'items', 'totalItems', 'totalAmount', 'createdAt'
+        ]);
+    }
+
+    // ──────────────────────────────────────────────────────────
+    //  KOLEKSI: transactions
+    // ──────────────────────────────────────────────────────────
+    match /transactions/{orderId} {
+
+      // Customer boleh CREATE — tanpa login, dengan validasi ketat.
+      // Harga dari client tidak divalidasi terhadap katalog.
+      // Admin wajib verifikasi sebelum konfirmasi.
+      allow create: if isValidNewOrder(request.resource.data);
+
+      // Hanya admin yang boleh membaca dokumen individual
+      allow get:  if isAdmin();
+
+      // Hanya admin yang boleh membaca seluruh koleksi (dashboard)
+      allow list: if isAdmin();
+
+      // Admin boleh update — hanya field yang diizinkan, via MapDiff
+      allow update: if isAdmin()
+                    && isValidAdminUpdate(
+                         request.resource.data.diff(resource.data)
+                       );
+
+      // Tidak ada yang boleh menghapus transaksi
+      allow delete: if false;
+    }
+
+    // ──────────────────────────────────────────────────────────
+    //  KOLEKSI: products  (jika katalog dipindah ke Firestore)
+    // ──────────────────────────────────────────────────────────
+    match /products/{productId} {
+      allow read:                   if true;        // katalog publik
+      allow create, update, delete: if isAdmin();   // hanya admin
+    }
+
+    // ──────────────────────────────────────────────────────────
+    //  SEMUA KOLEKSI LAIN: DENY ALL
+    // ──────────────────────────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+  }
+}
